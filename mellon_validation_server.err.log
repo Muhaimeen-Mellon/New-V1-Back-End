@@ -1,0 +1,25 @@
+2026-04-14 19:56:46,720 INFO [runtime_config] Using configured Supabase backend.
+2026-04-14 19:56:46,969 INFO [__main__] Mellon runtime booted with snapshot: {'storage_mode': 'supabase', 'storage': {'backend': 'supabase', 'connected': True, 'fallback_active': False, 'supabase_configured': True}, 'model_mode': 'local-ollama', 'default_model': 'qwen2.5:0.5b', 'debug': False}
+2026-04-14 19:56:46,978 INFO [__main__] Available routes:
+2026-04-14 19:56:46,979 INFO [__main__] /static/<path:filename> -> static
+2026-04-14 19:56:46,980 INFO [__main__] / -> home
+2026-04-14 19:56:46,981 INFO [__main__] /app -> mellon_app
+2026-04-14 19:56:46,982 INFO [__main__] /status -> status
+2026-04-14 19:56:46,982 INFO [__main__] /hello -> say_hello
+2026-04-14 19:56:46,982 INFO [__main__] /chat -> chat
+2026-04-14 19:56:46,982 INFO [__main__] /dream -> trigger_dream
+2026-04-14 19:56:46,982 INFO [__main__] /simulate -> simulate
+2026-04-14 19:56:46,983 INFO [__main__] /codex -> get_codex_entries
+2026-04-14 19:56:46,983 INFO [__main__] /reflections -> get_reflections
+2026-04-14 19:56:46,983 INFO [__main__] /memory -> get_memory_entries
+2026-04-14 19:56:46,984 INFO [__main__] /memory/tree -> get_memory_tree
+2026-04-14 19:56:46,984 INFO [__main__] /knowledge -> fetch_knowledge
+2026-04-14 19:56:46,984 INFO [__main__] /knowledge -> add_knowledge
+2026-04-14 19:56:46,984 INFO [__main__] /learn -> learn_knowledge_get
+2026-04-14 19:56:46,984 INFO [__main__] /learn -> learn_knowledge
+2026-04-14 19:56:46,984 INFO [__main__] /deepseek -> query_deepseek
+2026-04-14 19:56:46,997 INFO [werkzeug] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://10.249.150.182:5000
+2026-04-14 19:56:46,998 INFO [werkzeug] [33mPress CTRL+C to quit[0m

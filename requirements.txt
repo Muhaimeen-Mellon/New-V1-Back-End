@@ -1,0 +1,41 @@
+# Core framework
+flask
+flask-cors
+gunicorn
+
+# HTTP and async
+requests
+httpx
+aiohttp
+apscheduler
+
+# Env/config
+python-dotenv
+
+# Supabase client and storage
+supabase
+psycopg2-binary
+storage3
+
+# AI API clients
+openai
+
+# Logging and debugging
+loguru
+colorama
+
+# Testing
+pytest
+pytest-mock
+
+# Parsing and model support
+typing-extensions
+pydantic
+pydantic-core
+
+# Utility support
+python-dateutil
+yarl
+sniffio
+tqdm
+orjson

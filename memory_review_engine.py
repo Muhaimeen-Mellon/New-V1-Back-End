@@ -30,8 +30,34 @@ IDENTITY_QUERY_MARKERS = {
     "role",
 }
 
+STRICT_ATTRIBUTE_QUERY_MARKERS = {
+    "favorite",
+    "favourite",
+    "prefer",
+    "prefers",
+    "preferred",
+    "color",
+    "language",
+    "planet",
+    "name",
+    "backend",
+}
+
+NON_DISCRIMINATIVE_QUERY_TOKENS = {
+    "favorite",
+    "favourite",
+    "prefer",
+    "prefers",
+    "preferred",
+    "already",
+    "current",
+    "view",
+    "role",
+}
+
 GENERIC_SUPPORT_TOKENS = {
     "mellon",
+    "mellon's",
     "remember",
     "memory",
     "internal",
@@ -110,6 +136,15 @@ class MemoryReviewEngine:
             hits=hits,
             anchor_tokens=support_anchor_tokens,
         )
+        phrase_anchor_coverage, matched_phrase_anchors = self._measure_phrase_anchor_coverage(
+            hits=hits,
+            retrieval_plan=retrieval_plan,
+        )
+        specific_anchor_tokens = self._extract_specific_anchor_tokens(support_anchor_tokens)
+        specific_anchor_coverage, matched_specific_anchor_tokens = self._measure_anchor_coverage(
+            hits=hits,
+            anchor_tokens=specific_anchor_tokens,
+        )
 
         factual_covered = "factual" in coverage
         profile_covered = "profile" in coverage
@@ -142,14 +177,11 @@ class MemoryReviewEngine:
         )
 
         identity_query = any(marker in normalize_text(query) for marker in IDENTITY_QUERY_MARKERS)
+        strict_attribute_query = any(marker in normalize_text(query) for marker in STRICT_ATTRIBUTE_QUERY_MARKERS)
         gap_detected = bool(missing_layers) or hit_count == 0 or (input_type == "factual" and not factual_covered)
         issue_tags: List[str] = []
 
-        if conflict_detected:
-            review_state = "conflicting_memory"
-            review_reason = "conflicting_traces"
-            issue_tags.append("conflicting_traces")
-        elif not hits:
+        if not hits:
             review_state = "insufficient_memory"
             review_reason = "no_relevant_memory"
             issue_tags.append("missing_memory")
@@ -161,11 +193,25 @@ class MemoryReviewEngine:
             review_state = "insufficient_memory"
             review_reason = "missing_factual_layer"
             issue_tags.append("missing_factual_layer")
+        elif (
+            strict_attribute_query
+            and specific_anchor_tokens
+            and specific_anchor_coverage < 0.5
+            and phrase_anchor_coverage < 0.5
+        ):
+            review_state = "insufficient_memory"
+            review_reason = "subject_gap"
+            gap_detected = True
+            issue_tags.extend(["subject_gap", *specific_anchor_tokens[:3]])
         elif support_anchor_tokens and anchor_coverage < MIN_ANCHOR_COVERAGE:
             review_state = "insufficient_memory"
             review_reason = "subject_gap"
             gap_detected = True
             issue_tags.extend(["subject_gap", *support_anchor_tokens[:3]])
+        elif conflict_detected:
+            review_state = "conflicting_memory"
+            review_reason = "conflicting_traces"
+            issue_tags.append("conflicting_traces")
         elif vague_future_support:
             review_state = "reasoning_risk"
             review_reason = "vague_future_traces"
@@ -534,6 +580,13 @@ class MemoryReviewEngine:
                 break
         return anchors
 
+    def _extract_specific_anchor_tokens(self, anchor_tokens: Sequence[str]) -> List[str]:
+        return [
+            token
+            for token in anchor_tokens
+            if token not in NON_DISCRIMINATIVE_QUERY_TOKENS and token not in GENERIC_SUPPORT_TOKENS
+        ]
+
     def _measure_anchor_coverage(
         self,
         *,
@@ -568,6 +621,39 @@ class MemoryReviewEngine:
                 matched.append(anchor)
 
         return round(len(matched) / max(1, len(anchor_tokens)), 4), matched
+
+    def _measure_phrase_anchor_coverage(
+        self,
+        *,
+        hits: Sequence[Dict[str, Any]],
+        retrieval_plan: QueryRetrievalPlan,
+    ) -> tuple[float, List[str]]:
+        phrase_anchors = [
+            normalize_text(keyword)
+            for keyword in retrieval_plan.keywords
+            if " " in normalize_text(keyword)
+        ]
+        if not phrase_anchors:
+            return 1.0, []
+
+        candidate_texts: List[str] = []
+        for hit in list(hits)[:4]:
+            if hit.get("source") == "codex":
+                continue
+            node = hit.get("node") or {}
+            metadata = node.get("metadata") or {}
+            fragments = [
+                node.get("summary", ""),
+                node.get("text", ""),
+                " ".join(node.get("keywords") or []),
+                " ".join(metadata.get("top_summaries") or []),
+            ]
+            candidate_text = " ".join(fragment for fragment in fragments if fragment).strip()
+            if candidate_text:
+                candidate_texts.append(normalize_text(candidate_text))
+
+        matched = [phrase for phrase in phrase_anchors if any(phrase in text for text in candidate_texts)]
+        return round(len(matched) / max(1, len(phrase_anchors)), 4), matched
 
     def _anchor_matches(
         self,

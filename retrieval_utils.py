@@ -20,6 +20,9 @@ STOPWORDS = {
     "by",
     "for",
     "from",
+    "had",
+    "has",
+    "have",
     "how",
     "i",
     "if",
@@ -39,6 +42,11 @@ STOPWORDS = {
     "they",
     "this",
     "to",
+    "during",
+    "show",
+    "shown",
+    "shows",
+    "user",
     "was",
     "we",
     "what",
@@ -65,6 +73,19 @@ ATTRIBUTE_CONTRADICTION_MARKERS = {
     "role",
     "likes",
     "loves",
+}
+GENERIC_CONFLICT_TOKENS = {
+    "mellon",
+    "mellon's",
+    "llm",
+    "memory",
+    "internal",
+    "system",
+    "architecture",
+    "project",
+    "behavior",
+    "continuity",
+    "main",
 }
 COMPLEXITY_MARKERS = {
     "why",
@@ -370,6 +391,35 @@ def fuse_relevance_scores(semantic_score: float, lexical_score: float, semantic_
     )
 
 
+def normalize_recency_score(recency_rank: int, pool_size: int) -> float:
+    if pool_size <= 1:
+        return 1.0
+    normalized = 1.0 - (max(0, recency_rank) / max(1, pool_size - 1))
+    return round(max(0.0, min(normalized, 1.0)), 4)
+
+
+def compute_hybrid_memory_score(
+    *,
+    embedding_similarity: float,
+    lexical_score: float,
+    salience_score: float,
+    recency_score: float,
+    reinforcement_score: float,
+    identity_relevance: float,
+    contradiction_penalty: float = 0.0,
+) -> float:
+    score = (
+        (0.45 * max(0.0, min(embedding_similarity, 1.0)))
+        + (0.20 * max(0.0, min(lexical_score, 1.0)))
+        + (0.15 * max(0.0, min(salience_score, 1.0)))
+        + (0.10 * max(0.0, min(recency_score, 1.0)))
+        + (0.05 * max(0.0, min(reinforcement_score, 1.0)))
+        + (0.05 * max(0.0, min(identity_relevance, 1.0)))
+        - max(0.0, min(contradiction_penalty, 1.0))
+    )
+    return round(max(0.0, min(score, 1.0)), 4)
+
+
 def compute_relevance_score(query: str, candidate: str, recency_rank: int = 0) -> float:
     return compute_semantic_proxy_score(query, candidate, recency_rank=recency_rank)
 
@@ -423,7 +473,7 @@ def pairwise_conflict_detected(texts: Sequence[str]) -> bool:
         if not left_tokens:
             continue
         left_negated = bool(left_tokens & NEGATION_MARKERS)
-        left_affirmed = bool(left_tokens & AFFIRMATION_MARKERS)
+        left_core_tokens = left_tokens - NEGATION_MARKERS - AFFIRMATION_MARKERS
         for right in normalized[index + 1 :]:
             right_tokens = unique_tokens(right)
             if not right_tokens:
@@ -432,8 +482,16 @@ def pairwise_conflict_detected(texts: Sequence[str]) -> bool:
             if len(overlap) < 3:
                 continue
             right_negated = bool(right_tokens & NEGATION_MARKERS)
-            right_affirmed = bool(right_tokens & AFFIRMATION_MARKERS)
-            if (left_negated and right_affirmed) or (left_affirmed and right_negated):
+            right_core_tokens = right_tokens - NEGATION_MARKERS - AFFIRMATION_MARKERS
+            meaningful_overlap = overlap - GENERIC_CONFLICT_TOKENS
+            core_union = left_core_tokens | right_core_tokens
+            core_overlap = left_core_tokens & right_core_tokens
+            if (
+                left_negated != right_negated
+                and len(meaningful_overlap) >= 2
+                and core_union
+                and (len(core_overlap) / len(core_union)) >= 0.6
+            ):
                 return True
             shared_attribute_markers = overlap & ATTRIBUTE_CONTRADICTION_MARKERS
             left_unique = left_tokens - overlap

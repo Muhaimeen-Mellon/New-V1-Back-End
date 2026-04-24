@@ -45,7 +45,9 @@ class MellonSettings:
     port: int
     debug: bool
     supabase_url: Optional[str]
-    supabase_anon_key: Optional[str]
+    supabase_key: Optional[str]
+    embedding_enabled: bool
+    embedding_model: str
     local_llm_enabled: bool
     local_llm_base_url: str
     local_llm_model: str
@@ -60,7 +62,15 @@ class MellonSettings:
 
     @property
     def has_supabase(self) -> bool:
-        return bool(self.supabase_url and self.supabase_anon_key)
+        return bool(self.supabase_url and self.supabase_key)
+
+    @property
+    def supabase_anon_key(self) -> Optional[str]:
+        return self.supabase_key
+
+    @property
+    def has_embeddings(self) -> bool:
+        return self.embedding_enabled
 
     @property
     def has_local_llm(self) -> bool:
@@ -102,7 +112,14 @@ def get_settings() -> MellonSettings:
         port=int(os.getenv("PORT", "5000")),
         debug=_as_bool(os.getenv("FLASK_DEBUG"), default=False),
         supabase_url=os.getenv("SUPABASE_URL"),
-        supabase_anon_key=os.getenv("SUPABASE_ANON_KEY"),
+        supabase_key=(
+            os.getenv("SUPABASE_ANON_KEY")
+            or os.getenv("SUPABASE_SECRET_KEY")
+            or os.getenv("SUPABASE_KEY")
+            or os.getenv("SUPABASE_API_KEY")
+        ),
+        embedding_enabled=_as_bool(os.getenv("EMBEDDING_ENABLED"), default=True),
+        embedding_model=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
         local_llm_enabled=_as_bool(os.getenv("LOCAL_LLM_ENABLED"), default=True),
         local_llm_base_url=os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:11434"),
         local_llm_model=os.getenv("LOCAL_LLM_MODEL", "qwen2.5:0.5b"),
@@ -220,16 +237,33 @@ def get_supabase_client() -> Any:
     settings = get_settings()
 
     if settings.has_supabase:
+        api_key = settings.supabase_key or ""
         try:
+            if api_key.startswith("sb_secret_"):
+                from supabase_rest_client import RestSupabaseClient
+
+                logger.info("Using REST-backed Supabase client with secret-key auth.")
+                return RestSupabaseClient(settings.supabase_url or "", api_key)
+
             from supabase import create_client
 
             logger.info("Using configured Supabase backend.")
-            return create_client(settings.supabase_url, settings.supabase_anon_key)
+            return create_client(settings.supabase_url, api_key)
         except Exception as exc:
-            logger.warning(
-                "Supabase initialization failed; falling back to in-memory storage. %s",
-                exc,
-            )
+            try:
+                from supabase_rest_client import RestSupabaseClient
+
+                logger.warning(
+                    "Native Supabase initialization failed; falling back to REST client. %s",
+                    exc,
+                )
+                return RestSupabaseClient(settings.supabase_url or "", api_key)
+            except Exception as rest_exc:
+                logger.warning(
+                    "Supabase initialization failed; falling back to in-memory storage. native=%s rest=%s",
+                    exc,
+                    rest_exc,
+                )
     else:
         logger.info("Supabase credentials not configured; using in-memory storage.")
 
@@ -240,6 +274,8 @@ def get_storage_mode() -> str:
     client = get_supabase_client()
     if isinstance(client, LocalSupabaseClient):
         return "in-memory"
+    if getattr(client, "mode", "") == "supabase-rest":
+        return "supabase-rest"
     return "supabase"
 
 
@@ -248,8 +284,8 @@ def get_storage_status() -> Dict[str, Any]:
     storage_mode = get_storage_mode()
     return {
         "backend": storage_mode,
-        "connected": storage_mode == "supabase",
-        "fallback_active": storage_mode != "supabase",
+        "connected": storage_mode in {"supabase", "supabase-rest"},
+        "fallback_active": storage_mode not in {"supabase", "supabase-rest"},
         "supabase_configured": settings.has_supabase,
     }
 
@@ -272,6 +308,8 @@ def get_runtime_snapshot() -> Dict[str, Any]:
     return {
         "storage_mode": get_storage_mode(),
         "storage": get_storage_status(),
+        "embedding_mode": "sentence-transformers" if settings.has_embeddings else "disabled",
+        "embedding_model": settings.embedding_model if settings.has_embeddings else None,
         "model_mode": model_mode,
         "default_model": default_model,
         "debug": settings.debug,

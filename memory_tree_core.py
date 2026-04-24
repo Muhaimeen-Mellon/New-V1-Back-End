@@ -5,15 +5,25 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from embedding_core import (
+    cosine_similarity,
+    embed_text,
+    embed_texts,
+    get_embedding_model_name,
+    get_embedding_runtime,
+)
 from retrieval_utils import (
+    STOPWORDS,
     QueryRetrievalPlan,
     build_preview,
     build_query_retrieval_plan,
     compute_bm25_lexical_scores,
+    compute_hybrid_memory_score,
     compute_relevance_score,
     compute_semantic_proxy_score,
     compute_temporal_coherence,
     fuse_relevance_scores,
+    normalize_recency_score,
     normalize_text,
     pairwise_conflict_detected,
     source_alignment_prior,
@@ -22,6 +32,31 @@ from retrieval_utils import (
 from runtime_config import get_supabase_client
 
 logger = logging.getLogger(__name__)
+
+STRICT_ATTRIBUTE_QUERY_TOKENS = {
+    "favorite",
+    "favourite",
+    "prefer",
+    "prefers",
+    "preferred",
+    "color",
+    "language",
+    "planet",
+    "name",
+    "backend",
+}
+
+GENERIC_QUERY_TOKENS = {
+    "mellon",
+    "mellon's",
+    "what",
+    "does",
+    "already",
+    "remember",
+    "internal",
+    "main",
+    "current",
+}
 
 
 def _now_iso() -> str:
@@ -43,6 +78,7 @@ class MemoryTreeCore:
         self._links_available: Optional[bool] = None
         self._updates_available: Optional[bool] = None
         self._typed_columns_available: Optional[bool] = None
+        self._embedding_model_name = get_embedding_model_name()
 
     def remember(
         self,
@@ -96,6 +132,7 @@ class MemoryTreeCore:
             association_strength=association_strength,
             metadata=metadata,
         )
+        self._attach_embedding_metadata(node=node_payload, related_input=related_input)
         snapshot_payload = {
             "version": "memory-tree-v1",
             "last_accessed_at": None,
@@ -208,6 +245,22 @@ class MemoryTreeCore:
                 "access_count": (existing_node or {}).get("access_count", 0),
                 "association_links": (existing_node or {}).get("association_links", []),
             }
+            metadata["salience_score"] = float(
+                memory.get(
+                    "salience_score",
+                    existing_metadata.get(
+                        "salience_score",
+                        min(
+                            1.0,
+                            max(
+                                float(memory.get("importance_score") or 0.0),
+                                float(memory.get("identity_relevance") or 0.0),
+                                0.78 if memory.get("pillar_memory") else 0.52,
+                            ),
+                        ),
+                    ),
+                )
+            )
             node_payload = self._build_node_payload(
                 source_kind=str(memory.get("source_kind") or "memory"),
                 text=str(memory.get("text") or ""),
@@ -226,6 +279,10 @@ class MemoryTreeCore:
                 association_strength=float(memory.get("association_strength") or (0.88 if memory.get("pillar_memory") else 0.72)),
                 metadata=metadata,
             )
+            self._attach_embedding_metadata(
+                node=node_payload,
+                related_input=str(memory.get("summary") or memory.get("text") or ""),
+            )
             snapshot_payload = {
                 "version": "memory-tree-v1",
                 "last_accessed_at": node_payload.get("last_accessed_at"),
@@ -235,7 +292,7 @@ class MemoryTreeCore:
                 "association_links": node_payload.get("association_links", []),
                 "contradiction_links": node_payload["contradiction_links"],
                 "active_context_reason": f"seed:{pack_id}",
-                "salience_score": 0.0,
+                "salience_score": float(metadata.get("salience_score", 0.0)),
             }
 
             row_record = {
@@ -402,7 +459,7 @@ class MemoryTreeCore:
             leaf_hits=leaf_hits,
             row_lookup=row_lookup,
         )
-        gated_hits, conflict_detected, layer_coverage = self._gate_candidates(
+        gated_hits, conflict_detected, layer_coverage, conflict_hits = self._gate_candidates(
             input_type=input_type,
             retrieval_plan=plan,
             leaf_hits=leaf_hits,
@@ -413,7 +470,8 @@ class MemoryTreeCore:
         if gated_hits:
             self.reinforce_hits(user_id=user_id, hits=gated_hits, query=query)
         if conflict_detected and gated_hits:
-            self.mark_contradictions(user_id=user_id, hits=gated_hits[:3], query=query)
+            conflict_hits = self._conflict_candidate_hits(gated_hits, retrieval_plan=plan)
+            self.mark_contradictions(user_id=user_id, hits=conflict_hits[:3], query=query)
 
         details = {
             "hits": gated_hits,
@@ -424,6 +482,7 @@ class MemoryTreeCore:
             "gated_hit_count": len(gated_hits),
             "layer_coverage": layer_coverage,
             "conflict_detected": conflict_detected,
+            "conflict_hits": conflict_hits,
         }
         return details if return_details else gated_hits
 
@@ -510,9 +569,6 @@ class MemoryTreeCore:
                         evidence=query,
                     )
 
-        if pairwise_conflict_detected([hit.get("content", "") for hit in hit_list[:3]]):
-            self.mark_contradictions(user_id=user_id, hits=hit_list[:3], query=query)
-
     def mark_contradictions(self, *, user_id: str, hits: Iterable[Dict[str, Any]], query: str) -> None:
         hit_list = [hit for hit in hits if hit.get("entry", {}).get("id")]
         if len(hit_list) < 2:
@@ -524,6 +580,17 @@ class MemoryTreeCore:
                 break
             entry = hit["entry"]
             node = hit.get("node") or {}
+            metadata = dict(node.get("metadata") or {})
+            contradiction_queries = [
+                str(value).strip()
+                for value in metadata.get("contradiction_queries", [])
+                if str(value).strip()
+            ]
+            if query.strip() and query.strip() not in contradiction_queries:
+                contradiction_queries.append(query.strip())
+            metadata["contradiction_queries"] = contradiction_queries[-6:]
+            metadata["contradiction_last_query"] = query
+            node["metadata"] = metadata
             snapshot = self._load_snapshot(entry)
             contradiction_links = sorted(set((node.get("contradiction_links") or []) + [value for value in node_ids if value != entry["id"]]))
             node["contradiction_flag"] = True
@@ -702,6 +769,113 @@ class MemoryTreeCore:
             )
         return node
 
+    def _attach_embedding_metadata(self, *, node: Dict[str, Any], related_input: str = "") -> None:
+        metadata = node.setdefault("metadata", {})
+        embedding_text = self._embedding_text(node=node, related_input=related_input)
+        metadata["embedding_text"] = embedding_text
+        metadata["embedding_model"] = self._embedding_model_name
+        metadata["embedding_provider"] = "sentence-transformers"
+        vector = embed_text(embedding_text)
+        if vector:
+            metadata["embedding_vector"] = vector
+            metadata["embedding_dimensions"] = len(vector)
+            metadata["embedding_generated_at"] = _now_iso()
+            metadata["embedding_status"] = "ready"
+        else:
+            metadata.pop("embedding_vector", None)
+            metadata.pop("embedding_dimensions", None)
+            metadata["embedding_status"] = "missing"
+
+    def _embedding_text(self, *, node: Dict[str, Any], related_input: str = "") -> str:
+        metadata = node.get("metadata") or {}
+        return self._compose_candidate_text(
+            node=node,
+            related_input=related_input,
+            source_text=metadata.get("source", ""),
+        )
+
+    def _compose_candidate_text(
+        self,
+        *,
+        node: Dict[str, Any],
+        related_input: str = "",
+        source_text: str = "",
+    ) -> str:
+        metadata = node.get("metadata") or {}
+        key_variables = metadata.get("key_variables") or []
+        predicted_outcomes = metadata.get("predicted_outcomes") or []
+        thematic_links = metadata.get("thematic_links") or []
+        causal_links = metadata.get("causal_links") or []
+        scenario_summary = metadata.get("scenario_summary", "")
+        uncertainty = metadata.get("uncertainty", "")
+        confidence = metadata.get("confidence", "")
+
+        causal_fragments: List[str] = []
+        for link in causal_links:
+            if isinstance(link, dict):
+                cause = str(link.get("cause", "")).strip()
+                effect = str(link.get("effect", "")).strip()
+                if cause or effect:
+                    causal_fragments.append(f"{cause} {effect}".strip())
+            elif link:
+                causal_fragments.append(str(link))
+
+        return " ".join(
+            value
+            for value in [
+                node.get("summary", ""),
+                " ".join(node.get("keywords", []) or []),
+                related_input,
+                source_text,
+                scenario_summary,
+                " ".join(str(item) for item in key_variables),
+                " ".join(str(item) for item in predicted_outcomes),
+                " ".join(str(item) for item in thematic_links),
+                " ".join(causal_fragments),
+                str(uncertainty),
+                str(confidence),
+                node.get("text", ""),
+            ]
+            if value
+        ).strip()
+
+    def _node_embedding_vector(self, node: Dict[str, Any]) -> Optional[List[float]]:
+        metadata = node.get("metadata") or {}
+        raw_vector = metadata.get("embedding_vector")
+        if not isinstance(raw_vector, list) or not raw_vector:
+            return None
+        model_name = str(metadata.get("embedding_model") or "")
+        if model_name and model_name != self._embedding_model_name:
+            return None
+        try:
+            return [float(value) for value in raw_vector]
+        except (TypeError, ValueError):
+            return None
+
+    def refresh_embedding_for_row(self, row: Dict[str, Any]) -> bool:
+        row_id = row.get("id")
+        node = self._load_node(row)
+        if not row_id or not node:
+            return False
+
+        self._attach_embedding_metadata(node=node, related_input=str(row.get("related_input") or ""))
+        snapshot = self._load_snapshot(row)
+        payload = {
+            "memory_node": json.dumps(node),
+            "tree_snapshot": json.dumps(snapshot),
+        }
+        if self._typed_columns_available:
+            payload.update(self._typed_columns_from_node(node))
+        try:
+            self.client.table("core_memory_tree").update(payload).eq("id", row_id).execute()
+            row.update(payload)
+            self._updates_available = True
+            return True
+        except Exception as exc:
+            self._updates_available = False
+            logger.warning("Failed to refresh embedding metadata for row '%s': %s", row_id, exc)
+            return False
+
     def _load_snapshot(self, row: Dict[str, Any]) -> Dict[str, Any]:
         raw_value = row.get("tree_snapshot")
         if not raw_value:
@@ -724,6 +898,7 @@ class MemoryTreeCore:
         filtered_rows: List[Dict[str, Any]] = []
         filtered_nodes: List[Dict[str, Any]] = []
         filtered_texts: List[str] = []
+        embedding_runtime = get_embedding_runtime()
 
         for recency_rank, row in enumerate(rows.values()):
             node = self._load_node(row)
@@ -739,8 +914,23 @@ class MemoryTreeCore:
             filtered_texts.append(self._candidate_text(row=row, node=node))
 
         lexical_scores = compute_bm25_lexical_scores(retrieval_plan.keywords or tokenize(query), filtered_texts)
+        query_embedding = embed_text(query) if embedding_runtime.available else None
+        generated_embeddings: Dict[int, Optional[List[float]]] = {}
+        if query_embedding:
+            missing_indices: List[int] = []
+            missing_texts: List[str] = []
+            for index, node in enumerate(filtered_nodes):
+                if self._node_embedding_vector(node) is None:
+                    missing_indices.append(index)
+                    missing_texts.append(filtered_texts[index])
+            if missing_texts:
+                generated_embeddings = dict(zip(missing_indices, embed_texts(missing_texts)))
+
         results: List[Dict[str, Any]] = []
-        for row, node, lexical_score, candidate_text in zip(filtered_rows, filtered_nodes, lexical_scores, filtered_texts):
+        pool_size = max(1, len(filtered_rows))
+        for index, (row, node, lexical_score, candidate_text) in enumerate(
+            zip(filtered_rows, filtered_nodes, lexical_scores, filtered_texts)
+        ):
             layers = self._determine_logical_layers(node)
             semantic_score = compute_semantic_proxy_score(
                 query,
@@ -751,13 +941,32 @@ class MemoryTreeCore:
                 query_keywords=retrieval_plan.keywords,
                 recency_rank=row.get("__recency_rank", 0),
             )
-            fused_score = fuse_relevance_scores(semantic_score, lexical_score, semantic_weight=0.9)
-            if fused_score <= 0.0:
+            candidate_embedding = self._node_embedding_vector(node) or generated_embeddings.get(index)
+            embedding_similarity = cosine_similarity(query_embedding, candidate_embedding) if query_embedding and candidate_embedding else 0.0
+            embedding_signal = embedding_similarity if query_embedding and candidate_embedding else semantic_score
+            recency_score = normalize_recency_score(int(row.get("__recency_rank", 0)), pool_size)
+            reinforcement_score = min(
+                1.0,
+                float(node.get("reinforcement_score", 0.0)) + (float(node.get("access_count", 0)) * 0.05),
+            )
+            contradiction_penalty = 0.18 if self._query_relevant_contradiction(node, retrieval_plan=retrieval_plan) else 0.0
+            hybrid_score = compute_hybrid_memory_score(
+                embedding_similarity=embedding_signal,
+                lexical_score=lexical_score,
+                salience_score=float((node.get("metadata") or {}).get("salience_score", 0.0)),
+                recency_score=recency_score,
+                reinforcement_score=reinforcement_score,
+                identity_relevance=float(node.get("identity_relevance", 0.0)),
+                contradiction_penalty=contradiction_penalty,
+            )
+            if lexical_score <= 0.0 and semantic_score <= 0.0 and embedding_signal < 0.15:
+                continue
+            if hybrid_score <= 0.0:
                 continue
             score = self._leaf_score(
                 node=node,
                 row=row,
-                fused_score=fused_score,
+                fused_score=hybrid_score,
                 input_type=input_type,
                 retrieval_plan=retrieval_plan,
                 layers=layers,
@@ -771,8 +980,9 @@ class MemoryTreeCore:
                     layers=layers,
                     score=score,
                     semantic_score=semantic_score,
+                    embedding_score=embedding_signal,
                     lexical_score=lexical_score,
-                    fused_score=fused_score,
+                    fused_score=hybrid_score,
                     propagated=False,
                     propagation_origin="leaf",
                     propagation_seed_score=score,
@@ -797,6 +1007,7 @@ class MemoryTreeCore:
         }
         if not leaf_hits:
             return list(candidates.values())
+        query_embedding = embed_text(query) if get_embedding_runtime().available else None
 
         propagation_depth = 0
         if retrieval_plan.complexity == "hybrid":
@@ -822,6 +1033,7 @@ class MemoryTreeCore:
                         row=parent_row,
                         seed_score=seed_score,
                         origin="ancestor",
+                        query_embedding=query_embedding,
                     )
                     if parent_hit:
                         candidates[parent_id] = self._prefer_higher_score(candidates.get(parent_id), parent_hit)
@@ -844,6 +1056,7 @@ class MemoryTreeCore:
                     row=associated_row,
                     seed_score=self._seed_score_for_related_row(associated_row, leaf_hits),
                     origin="association",
+                    query_embedding=query_embedding,
                 )
                 if associated_hit:
                     candidates[row_id] = self._prefer_higher_score(candidates.get(row_id), associated_hit)
@@ -859,6 +1072,7 @@ class MemoryTreeCore:
                 row=cluster_row,
                 seed_score=self._seed_score_for_related_row(cluster_row, leaf_hits),
                 origin="cluster",
+                query_embedding=query_embedding,
             )
             if cluster_hit:
                 candidates[row_id] = self._prefer_higher_score(candidates.get(row_id), cluster_hit)
@@ -876,6 +1090,7 @@ class MemoryTreeCore:
                     row=profile_row,
                     seed_score=max((hit.get("score", 0.0) for hit in leaf_hits), default=0.4),
                     origin="profile",
+                    query_embedding=query_embedding,
                 )
                 if profile_hit:
                     candidates[row_id] = self._prefer_higher_score(candidates.get(row_id), profile_hit)
@@ -890,9 +1105,9 @@ class MemoryTreeCore:
         leaf_hits: Sequence[Dict[str, Any]],
         propagated_candidates: Sequence[Dict[str, Any]],
         limit: int,
-    ) -> tuple[List[Dict[str, Any]], bool, List[str]]:
+    ) -> tuple[List[Dict[str, Any]], bool, List[str], List[Dict[str, Any]]]:
         if not propagated_candidates:
-            return [], False, []
+            return [], False, [], []
 
         anchor_times = [hit.get("entry", {}).get("created_at") for hit in leaf_hits]
         rescored: List[Dict[str, Any]] = []
@@ -908,11 +1123,19 @@ class MemoryTreeCore:
 
         rescored.sort(key=lambda item: item.get("score", 0.0), reverse=True)
         cutoff_score = rescored[min(limit - 1, len(rescored) - 1)].get("score", 0.0)
+        strict_attribute_query = bool(
+            set(tokenize(" ".join(retrieval_plan.keywords or []))) & STRICT_ATTRIBUTE_QUERY_TOKENS
+        )
 
         selected: List[Dict[str, Any]] = []
         cluster_counts: Dict[str, int] = {}
         for candidate in rescored:
             node = candidate.get("node") or {}
+            if strict_attribute_query and self._hit_query_alignment_strength(
+                hit=candidate,
+                retrieval_plan=retrieval_plan,
+            ) < 2:
+                continue
             cluster_id = node.get("cluster_id") or "uncategorized"
             is_profile = "profile" in candidate.get("layers", [])
             is_stale = self._age_decay_penalty(candidate.get("entry", {}).get("created_at"), bool(node.get("pillar_memory"))) >= 0.08
@@ -940,12 +1163,16 @@ class MemoryTreeCore:
                 else:
                     selected.append(profile_candidate)
 
-        conflict_detected = bool(selected) and (
-            pairwise_conflict_detected([hit.get("content", "") for hit in selected[:4]])
-            or any((hit.get("node") or {}).get("contradiction_flag") for hit in selected[:4])
+        conflict_candidates = self._conflict_candidate_hits(selected, retrieval_plan=retrieval_plan)
+        conflict_detected = len(conflict_candidates) >= 2 and (
+            pairwise_conflict_detected([hit.get("content", "") for hit in conflict_candidates[:4]])
+            or any(
+                self._query_relevant_contradiction(hit.get("node") or {}, retrieval_plan=retrieval_plan)
+                for hit in conflict_candidates[:4]
+            )
         )
         if conflict_detected and not retrieval_plan.comparison_seeking:
-            selected = self._collapse_conflicting_hits(selected, limit=limit)
+            selected = self._collapse_conflicting_hits(selected, limit=limit, retrieval_plan=retrieval_plan)
 
         selected.sort(key=lambda item: item.get("score", 0.0), reverse=True)
         layer_coverage = sorted(
@@ -956,7 +1183,7 @@ class MemoryTreeCore:
                 if layer in {"factual", "partial_pattern", "full_pattern", "profile"}
             }
         )
-        return selected[:limit], conflict_detected, layer_coverage
+        return selected[:limit], conflict_detected, layer_coverage, conflict_candidates[:4]
 
     def _build_hit(
         self,
@@ -966,6 +1193,7 @@ class MemoryTreeCore:
         layers: Sequence[str],
         score: float,
         semantic_score: float,
+        embedding_score: float,
         lexical_score: float,
         fused_score: float,
         propagated: bool,
@@ -982,6 +1210,7 @@ class MemoryTreeCore:
             "node": node,
             "layers": list(layers),
             "semantic_score": semantic_score,
+            "embedding_score": embedding_score,
             "lexical_score": lexical_score,
             "fused_score": fused_score,
             "propagated": propagated,
@@ -999,6 +1228,7 @@ class MemoryTreeCore:
         row: Dict[str, Any],
         seed_score: float,
         origin: str,
+        query_embedding: Optional[List[float]] = None,
     ) -> Optional[Dict[str, Any]]:
         node = self._load_node(row)
         if not node:
@@ -1020,10 +1250,27 @@ class MemoryTreeCore:
             retrieval_plan.keywords,
             [self._candidate_text(row=row, node=node)],
         )[0]
-        fused_score = fuse_relevance_scores(
-            semantic_score=semantic_score,
-            lexical_score=lexical_score,
+        candidate_embedding = self._node_embedding_vector(node)
+        if query_embedding and candidate_embedding is None:
+            candidate_embedding = embed_text(self._candidate_text(row=row, node=node))
+        embedding_similarity = cosine_similarity(query_embedding, candidate_embedding) if query_embedding and candidate_embedding else 0.0
+        embedding_signal = embedding_similarity if query_embedding and candidate_embedding else semantic_score
+        recency_score = normalize_recency_score(int(row.get("__recency_rank", 0)), max(1, retrieval_plan.leaf_limit))
+        reinforcement_score = min(
+            1.0,
+            float(node.get("reinforcement_score", 0.0)) + (float(node.get("access_count", 0)) * 0.05),
         )
+        fused_score = compute_hybrid_memory_score(
+            embedding_similarity=embedding_signal,
+            lexical_score=lexical_score,
+            salience_score=float((node.get("metadata") or {}).get("salience_score", 0.0)),
+            recency_score=recency_score,
+            reinforcement_score=reinforcement_score,
+            identity_relevance=float(node.get("identity_relevance", 0.0)),
+            contradiction_penalty=0.18 if self._query_relevant_contradiction(node, retrieval_plan=retrieval_plan) else 0.0,
+        )
+        if lexical_score <= 0.0 and semantic_score <= 0.0 and embedding_signal < 0.15:
+            return None
         if fused_score <= 0.0:
             return None
         propagated_fused_score = min(1.0, fused_score + min(0.18, seed_score * 0.25))
@@ -1043,6 +1290,7 @@ class MemoryTreeCore:
             layers=layers,
             score=score,
             semantic_score=semantic_score,
+            embedding_score=embedding_signal,
             lexical_score=lexical_score,
             fused_score=propagated_fused_score,
             propagated=True,
@@ -1055,13 +1303,19 @@ class MemoryTreeCore:
             return incoming
         return incoming if incoming.get("score", 0.0) > existing.get("score", 0.0) else existing
 
-    def _collapse_conflicting_hits(self, hits: Sequence[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    def _collapse_conflicting_hits(
+        self,
+        hits: Sequence[Dict[str, Any]],
+        limit: int,
+        retrieval_plan: QueryRetrievalPlan,
+    ) -> List[Dict[str, Any]]:
         selected: List[Dict[str, Any]] = []
         contradiction_index: Dict[str, float] = {}
         for hit in sorted(hits, key=lambda item: item.get("score", 0.0), reverse=True):
             node = hit.get("node") or {}
             contradiction_links = set(node.get("contradiction_links") or [])
-            if contradiction_links and any(
+            relevant_conflict = self._query_relevant_contradiction(node, retrieval_plan=retrieval_plan)
+            if relevant_conflict and contradiction_links and any(
                 contradiction_index.get(linked_id, -1.0) >= hit.get("score", 0.0) for linked_id in contradiction_links
             ):
                 continue
@@ -1083,32 +1337,7 @@ class MemoryTreeCore:
         retrieval_plan: QueryRetrievalPlan,
         layers: Sequence[str],
     ) -> float:
-        importance = float(node.get("importance_score", 0.0))
-        emotional = float(node.get("emotional_weight", 0.0))
-        identity = float(node.get("identity_relevance", 0.0))
-        reinforcement = min(1.0, float(node.get("reinforcement_score", 0.0)) + (float(node.get("access_count", 0)) * 0.05))
-        decay_value = float(node.get("decay_value", 0.1))
-        pillar_bonus = 0.06 if node.get("pillar_memory") else 0.0
-        contradiction_penalty = 0.14 if node.get("contradiction_flag") else 0.0
-        layer_bonus = self._layer_match_bonus(layers=layers, retrieval_plan=retrieval_plan)
-        source_bonus = max(-0.04, source_alignment_prior(input_type, node.get("source_kind", "memory")))
-        age_penalty = self._age_decay_penalty(row.get("created_at"), node.get("pillar_memory", False))
-        association_bonus = min(0.06, float(node.get("association_strength", 0.0)) * 0.08)
-
-        score = (
-            (fused_score * 0.62)
-            + (importance * 0.1)
-            + (identity * 0.08)
-            + (emotional * 0.04)
-            + (reinforcement * 0.08)
-            + layer_bonus
-            + source_bonus
-            + pillar_bonus
-            + association_bonus
-        )
-        score += self._quality_adjustment(node=node, row=row, input_type=input_type)
-        score -= (decay_value * 0.06) + contradiction_penalty + age_penalty
-        return round(max(0.0, min(score, 1.0)), 4)
+        return round(max(0.0, min(fused_score, 1.0)), 4)
 
     def _gated_score(
         self,
@@ -1129,10 +1358,11 @@ class MemoryTreeCore:
         reinforcement = min(1.0, float(node.get("reinforcement_score", 0.0)) + (float(node.get("access_count", 0)) * 0.04))
         pillar_bonus = 0.07 if node.get("pillar_memory") else 0.0
         layer_bonus = self._layer_match_bonus(layers=layers, retrieval_plan=retrieval_plan)
-        contradiction_penalty = 0.16 if node.get("contradiction_flag") else 0.0
+        contradiction_penalty = 0.16 if self._query_relevant_contradiction(node, retrieval_plan=retrieval_plan) else 0.0
         propagation_bonus = min(0.08, float(candidate.get("propagation_seed_score", 0.0)) * 0.12) if candidate.get("propagated") else 0.0
         source_bonus = max(-0.04, source_alignment_prior(input_type, node.get("source_kind", "memory")))
         age_penalty = self._age_decay_penalty(candidate.get("entry", {}).get("created_at"), bool(node.get("pillar_memory"))) * 0.8
+        anchor_adjustment = self._query_anchor_adjustment(node=node, retrieval_plan=retrieval_plan)
 
         gated = (
             (float(candidate.get("score", 0.0)) * 0.58)
@@ -1142,10 +1372,179 @@ class MemoryTreeCore:
             + pillar_bonus
             + propagation_bonus
             + source_bonus
+            + anchor_adjustment
         )
         gated += self._quality_adjustment(node=node, row=candidate.get("entry", {}), input_type=input_type)
         gated -= contradiction_penalty + age_penalty
         return round(max(0.0, min(gated, 1.0)), 4)
+
+    def _query_anchor_adjustment(
+        self,
+        *,
+        node: Dict[str, Any],
+        retrieval_plan: QueryRetrievalPlan,
+    ) -> float:
+        query_keywords = [normalize_text(keyword) for keyword in retrieval_plan.keywords if normalize_text(keyword)]
+        if not query_keywords:
+            return 0.0
+
+        candidate_text = normalize_text(
+            " ".join(
+                value
+                for value in [
+                    node.get("summary", ""),
+                    node.get("text", ""),
+                    " ".join(node.get("keywords") or []),
+                ]
+                if value
+            )
+        )
+        if not candidate_text:
+            return 0.0
+
+        candidate_tokens = set(tokenize(candidate_text))
+        phrase_keywords = [keyword for keyword in query_keywords if " " in keyword]
+        phrase_matches = [phrase for phrase in phrase_keywords if phrase in candidate_text]
+
+        specific_tokens = [
+            token
+            for token in tokenize(" ".join(query_keywords))
+            if token not in GENERIC_QUERY_TOKENS and token not in STOPWORDS
+        ]
+        token_matches = [token for token in specific_tokens if token in candidate_tokens]
+        strict_attribute_query = bool(set(specific_tokens) & STRICT_ATTRIBUTE_QUERY_TOKENS)
+
+        if strict_attribute_query:
+            if phrase_matches:
+                return min(0.14, 0.1 + (0.02 * len(phrase_matches)))
+            if len(token_matches) >= 2:
+                return 0.07
+            return -0.14
+        if phrase_matches:
+            return min(0.08, 0.05 + (0.01 * len(phrase_matches)))
+        if len(token_matches) >= 2:
+            return 0.03
+        return 0.0
+
+    def _conflict_candidate_hits(
+        self,
+        hits: Sequence[Dict[str, Any]],
+        *,
+        retrieval_plan: QueryRetrievalPlan,
+    ) -> List[Dict[str, Any]]:
+        strict_attribute_query = bool(
+            set(tokenize(" ".join(retrieval_plan.keywords or []))) & STRICT_ATTRIBUTE_QUERY_TOKENS
+        )
+        aligned: List[Dict[str, Any]] = []
+        for hit in hits[:6]:
+            alignment = self._hit_query_alignment_strength(hit=hit, retrieval_plan=retrieval_plan)
+            if strict_attribute_query:
+                if alignment >= 2:
+                    aligned.append(hit)
+            elif alignment >= 1:
+                aligned.append(hit)
+        if len(aligned) >= 2:
+            return aligned
+        if strict_attribute_query:
+            return []
+        return aligned or list(hits[:4])
+
+    def _hit_query_alignment_strength(
+        self,
+        *,
+        hit: Dict[str, Any],
+        retrieval_plan: QueryRetrievalPlan,
+    ) -> int:
+        query_keywords = [normalize_text(keyword) for keyword in retrieval_plan.keywords if normalize_text(keyword)]
+        if not query_keywords:
+            return 0
+        node = hit.get("node") or {}
+        candidate_text = normalize_text(
+            " ".join(
+                value
+                for value in [
+                    node.get("summary", ""),
+                    node.get("text", ""),
+                    " ".join(node.get("keywords") or []),
+                ]
+                if value
+            )
+        )
+        if not candidate_text:
+            return 0
+        candidate_tokens = set(tokenize(candidate_text))
+        phrase_matches = sum(1 for phrase in query_keywords if " " in phrase and phrase in candidate_text)
+        token_matches = sum(
+            1
+            for token in tokenize(" ".join(query_keywords))
+            if token not in GENERIC_QUERY_TOKENS and token not in STOPWORDS and token in candidate_tokens
+        )
+        return (phrase_matches * 2) + token_matches
+
+    def _query_relevant_contradiction(
+        self,
+        node: Dict[str, Any],
+        *,
+        retrieval_plan: QueryRetrievalPlan,
+    ) -> bool:
+        if not node.get("contradiction_flag"):
+            return False
+
+        metadata = node.get("metadata") or {}
+        contradiction_queries = [
+            normalize_text(value)
+            for value in metadata.get("contradiction_queries", [])
+            if normalize_text(value)
+        ]
+        query_keywords = [normalize_text(keyword) for keyword in retrieval_plan.keywords if normalize_text(keyword)]
+        query_tokens = {
+            token
+            for token in tokenize(" ".join(query_keywords))
+            if token not in GENERIC_QUERY_TOKENS and token not in STOPWORDS
+        }
+        phrase_keywords = [keyword for keyword in query_keywords if " " in keyword]
+        strict_attribute_query = bool(query_tokens & STRICT_ATTRIBUTE_QUERY_TOKENS)
+
+        if contradiction_queries:
+            for stored_query in contradiction_queries[-6:]:
+                stored_tokens = {
+                    token
+                    for token in tokenize(stored_query)
+                    if token not in GENERIC_QUERY_TOKENS and token not in STOPWORDS
+                }
+                if strict_attribute_query:
+                    if phrase_keywords and any(phrase in stored_query for phrase in phrase_keywords):
+                        return True
+                    if len(query_tokens & stored_tokens) >= 2:
+                        return True
+                    continue
+                if query_tokens and stored_tokens and (query_tokens & stored_tokens):
+                    return True
+            return False
+
+        if not node.get("contradiction_links"):
+            return False
+
+        candidate_text = normalize_text(
+            " ".join(
+                value
+                for value in [
+                    node.get("summary", ""),
+                    node.get("text", ""),
+                    " ".join(node.get("keywords") or []),
+                ]
+                if value
+            )
+        )
+        if not candidate_text:
+            return False
+        alignment = self._hit_query_alignment_strength(
+            hit={"node": node},
+            retrieval_plan=retrieval_plan,
+        )
+        if strict_attribute_query:
+            return alignment >= 2
+        return alignment >= 3
 
     def _node_allowed_for_plan(
         self,
@@ -1226,42 +1625,11 @@ class MemoryTreeCore:
 
     def _candidate_text(self, *, row: Dict[str, Any], node: Dict[str, Any]) -> str:
         metadata = node.get("metadata") or {}
-        key_variables = metadata.get("key_variables") or []
-        predicted_outcomes = metadata.get("predicted_outcomes") or []
-        thematic_links = metadata.get("thematic_links") or []
-        causal_links = metadata.get("causal_links") or []
-        scenario_summary = metadata.get("scenario_summary", "")
-        uncertainty = metadata.get("uncertainty", "")
-        confidence = metadata.get("confidence", "")
-
-        causal_fragments: List[str] = []
-        for link in causal_links:
-            if isinstance(link, dict):
-                cause = str(link.get("cause", "")).strip()
-                effect = str(link.get("effect", "")).strip()
-                if cause or effect:
-                    causal_fragments.append(f"{cause} {effect}".strip())
-            elif link:
-                causal_fragments.append(str(link))
-
-        return " ".join(
-            value
-            for value in [
-                node.get("summary", ""),
-                " ".join(node.get("keywords", []) or []),
-                row.get("related_input", ""),
-                metadata.get("source", ""),
-                scenario_summary,
-                " ".join(str(item) for item in key_variables),
-                " ".join(str(item) for item in predicted_outcomes),
-                " ".join(str(item) for item in thematic_links),
-                " ".join(causal_fragments),
-                str(uncertainty),
-                str(confidence),
-                node.get("text", ""),
-            ]
-            if value
-        ).strip()
+        return self._compose_candidate_text(
+            node=node,
+            related_input=str(row.get("related_input", "")),
+            source_text=metadata.get("source", ""),
+        )
 
     def _is_prompt_echo(self, *, node: Dict[str, Any], row: Dict[str, Any], query: str) -> bool:
         query_text = normalize_text(query)

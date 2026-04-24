@@ -72,6 +72,31 @@ FRAGMENT_STOPWORDS = {
     "their",
 }
 
+STRICT_ATTRIBUTE_QUERY_TOKENS = {
+    "favorite",
+    "favourite",
+    "prefer",
+    "prefers",
+    "preferred",
+    "color",
+    "language",
+    "planet",
+    "name",
+    "backend",
+}
+
+GENERIC_QUERY_TOKENS = {
+    "mellon",
+    "mellon's",
+    "what",
+    "does",
+    "already",
+    "remember",
+    "internal",
+    "main",
+    "current",
+}
+
 
 class CodexEngine:
     def __init__(
@@ -449,6 +474,12 @@ class CodexEngine:
     def _select_synthesis_hits(self, memory_bundle: Dict[str, Any], limit: int = 3) -> List[Dict[str, Any]]:
         input_type = memory_bundle.get("input_type", "general")
         hits = list(memory_bundle.get("hits") or [])
+        query_keywords = [
+            normalize_text(keyword)
+            for keyword in (memory_bundle.get("query_keywords") or [])
+            if normalize_text(keyword)
+        ]
+        strict_attribute_query = bool(set(tokenize(" ".join(query_keywords))) & STRICT_ATTRIBUTE_QUERY_TOKENS)
         source_priority = {
             "factual": {"self_model": 7, "architecture": 6, "constraint": 5, "knowledge": 5, "user_model": 4, "memory": 4, "reflection": 1, "codex": 0},
             "introspective": {"user_model": 7, "self_model": 6, "memory": 6, "reflection": 4, "constraint": 2, "knowledge": 1, "codex": 0},
@@ -487,6 +518,9 @@ class CodexEngine:
             fragment = self._extract_hit_fragment(hit, input_type=input_type)
             if not fragment:
                 continue
+            alignment_score = self._query_alignment_score(fragment=fragment, query_keywords=query_keywords)
+            if strict_attribute_query and alignment_score <= 0:
+                continue
             if input_type == "future_modeling" and source not in {"simulation", "dream", "simulated_dream"} and hit.get("score", 0.0) < 0.55:
                 continue
             if source == "codex":
@@ -497,12 +531,12 @@ class CodexEngine:
                     continue
                 if codex_score < 0.62:
                     continue
-            ranked.append((priority_map.get(source, 0), float(hit.get("score", 0.0)), hit))
+            ranked.append((alignment_score, priority_map.get(source, 0), float(hit.get("score", 0.0)), hit))
 
-        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
         selected: List[Dict[str, Any]] = []
         seen_fragments: List[str] = []
-        for _, _, hit in ranked:
+        for _, _, _, hit in ranked:
             fragment = normalize_text(self._extract_hit_fragment(hit, input_type=input_type))
             if not fragment:
                 continue
@@ -512,7 +546,11 @@ class CodexEngine:
             selected.append(hit)
             if len(selected) >= limit:
                 break
-        return selected or hits[:limit]
+        if selected:
+            return selected
+        if strict_attribute_query:
+            return []
+        return hits[:limit]
 
     def _extract_hit_fragment(self, hit: Dict[str, Any], *, input_type: str) -> str:
         source = hit.get("source", "memory")
@@ -624,6 +662,19 @@ class CodexEngine:
             if len(token) > 2 and token not in FRAGMENT_STOPWORDS
         }
 
+    def _query_alignment_score(self, *, fragment: str, query_keywords: List[str]) -> int:
+        if not fragment or not query_keywords:
+            return 0
+        normalized_fragment = normalize_text(fragment)
+        fragment_tokens = set(tokenize(fragment))
+        phrase_matches = sum(1 for keyword in query_keywords if " " in keyword and keyword in normalized_fragment)
+        token_matches = sum(
+            1
+            for token in tokenize(" ".join(query_keywords))
+            if token not in GENERIC_QUERY_TOKENS and token not in FRAGMENT_STOPWORDS and token in fragment_tokens
+        )
+        return (phrase_matches * 2) + token_matches
+
     def _serialize_curated_hits(self, memory_bundle: Dict[str, Any], limit: int = 4) -> List[Dict[str, Any]]:
         input_type = memory_bundle.get("input_type", "general")
         fallback_reason = memory_bundle.get("fallback_reason")
@@ -651,7 +702,9 @@ class CodexEngine:
         return curated
 
     def _articulate_conflicting_memory(self, prompt: str, memory_bundle: Dict[str, Any]) -> str:
-        relevant_hits = self._select_synthesis_hits(memory_bundle, limit=3)
+        relevant_hits = self._select_conflict_hits(memory_bundle, limit=2)
+        if len(relevant_hits) < 2:
+            relevant_hits = self._select_synthesis_hits(memory_bundle, limit=3)
         fragments = [
             self._extract_hit_fragment(hit, input_type=memory_bundle.get("input_type", "general"))
             for hit in relevant_hits
@@ -670,6 +723,54 @@ class CodexEngine:
                 "I can't confirm it cleanly from memory alone."
             )
         return "My stored memory conflicts on this point, and I can't resolve it cleanly from internal memory alone."
+
+    def _select_conflict_hits(self, memory_bundle: Dict[str, Any], limit: int = 2) -> List[Dict[str, Any]]:
+        hits = list(memory_bundle.get("conflict_hits") or memory_bundle.get("leaf_hits") or memory_bundle.get("hits") or [])
+        hits_by_id = {
+            hit.get("entry", {}).get("id"): hit
+            for hit in hits
+            if hit.get("entry", {}).get("id")
+        }
+        best_pair: List[Dict[str, Any]] = []
+        best_score = -1.0
+        for hit in hits:
+            node = hit.get("node") or {}
+            linked_ids = node.get("contradiction_links") or []
+            for linked_id in linked_ids:
+                other = hits_by_id.get(linked_id)
+                if not other:
+                    continue
+                pair = [hit, other]
+                pair_score = sum(float(item.get("score", 0.0)) for item in pair)
+                if pair_score > best_score:
+                    best_score = pair_score
+                    best_pair = pair
+        if best_pair:
+            best_pair.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+            return best_pair[:limit]
+        leaf_hits = list(memory_bundle.get("leaf_hits") or [])
+        query_keywords = [
+            normalize_text(keyword)
+            for keyword in (memory_bundle.get("query_keywords") or [])
+            if normalize_text(keyword)
+        ]
+        strict_attribute_query = bool(set(tokenize(" ".join(query_keywords))) & STRICT_ATTRIBUTE_QUERY_TOKENS)
+        if strict_attribute_query and leaf_hits:
+            ranked_leaf_hits = sorted(
+                (
+                    hit
+                    for hit in leaf_hits
+                    if self._query_alignment_score(
+                        fragment=self._extract_hit_fragment(hit, input_type=memory_bundle.get("input_type", "general")),
+                        query_keywords=query_keywords,
+                    ) > 0
+                ),
+                key=lambda item: float(item.get("score", 0.0)),
+                reverse=True,
+            )
+            if len(ranked_leaf_hits) >= 2:
+                return ranked_leaf_hits[:limit]
+        return []
 
     def _articulate_partial_future(self, memory_bundle: Dict[str, Any]) -> str:
         hits = self._select_synthesis_hits(memory_bundle, limit=3)

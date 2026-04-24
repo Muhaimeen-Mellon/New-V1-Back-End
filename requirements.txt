@@ -19,6 +19,7 @@ storage3
 
 # AI API clients
 openai
+sentence-transformers
 
 # Logging and debugging
 loguru
@@ -34,6 +35,7 @@ pydantic
 pydantic-core
 
 # Utility support
+numpy
 python-dateutil
 yarl
 sniffio

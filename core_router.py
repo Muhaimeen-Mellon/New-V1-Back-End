@@ -21,6 +21,7 @@ class ChatRoutingResult:
     input_type: str
     tags: List[str]
     hits: List[Dict[str, Any]]
+    leaf_hits: List[Dict[str, Any]]
     confidence: float
     sufficient_memory: bool
     conflict_detected: bool
@@ -46,12 +47,14 @@ class ChatRoutingResult:
     reflection_ids_used: List[str]
     review_issue_tags: List[str]
     reflection_support: List[Dict[str, Any]]
+    conflict_hits: List[Dict[str, Any]]
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "input_type": self.input_type,
             "tags": self.tags,
             "hits": self.hits,
+            "leaf_hits": self.leaf_hits,
             "confidence": self.confidence,
             "sufficient_memory": self.sufficient_memory,
             "conflict_detected": self.conflict_detected,
@@ -77,6 +80,7 @@ class ChatRoutingResult:
             "reflection_ids_used": self.reflection_ids_used,
             "review_issue_tags": self.review_issue_tags,
             "reflection_support": self.reflection_support,
+            "conflict_hits": self.conflict_hits,
         }
 
 
@@ -138,6 +142,7 @@ class CoreRouter:
             input_type=classification["input_type"],
             tags=classification["tags"],
             hits=hits,
+            leaf_hits=retrieval.get("leaf_hits", []),
             confidence=decision["confidence"],
             sufficient_memory=review.recommended_strategy == "internal_memory_only",
             conflict_detected=review.memory_conflict_detected,
@@ -163,6 +168,7 @@ class CoreRouter:
             reflection_ids_used=review.reflection_ids_used,
             review_issue_tags=review.issue_tags,
             reflection_support=review.reflection_support,
+            conflict_hits=retrieval.get("conflict_hits", []),
         )
         logger.info(
             "Chat routing for user '%s': type=%s complexity=%s strategy=%s review=%s reason=%s confidence=%.2f layers=%s sources=%s modules=%s fallback=%s",
@@ -340,10 +346,12 @@ class CoreRouter:
         tree_details = {
             "hits": [],
             "leaf_hit_count": 0,
+            "leaf_hits": [],
             "propagated_hit_count": 0,
             "gated_hit_count": 0,
             "layer_coverage": [],
             "conflict_detected": False,
+            "conflict_hits": [],
         }
 
         if self.memory_tree:
@@ -403,18 +411,40 @@ class CoreRouter:
         normalized_hits.sort(key=lambda item: item.get("score", 0.0), reverse=True)
         normalized_hits = normalized_hits[: retrieval_plan.max_context_hits]
         layer_coverage = sorted({layer for hit in normalized_hits for layer in hit.get("layers", [])})
-        conflict_detected = tree_details.get("conflict_detected", False) or pairwise_conflict_detected(
-            [hit.get("content", "") for hit in normalized_hits[:4]]
+        conflict_candidates = normalized_hits[:4]
+        contradiction_flag_hits: List[Dict[str, Any]] = []
+        if self.memory_tree and hasattr(self.memory_tree, "_conflict_candidate_hits"):
+            conflict_candidates = self.memory_tree._conflict_candidate_hits(
+                normalized_hits,
+                retrieval_plan=retrieval_plan,
+            )
+            contradiction_flag_hits = [
+                hit
+                for hit in conflict_candidates[:4]
+                if hasattr(self.memory_tree, "_query_relevant_contradiction")
+                and self.memory_tree._query_relevant_contradiction(
+                    hit.get("node") or {},
+                    retrieval_plan=retrieval_plan,
+                )
+            ]
+        conflict_detected = tree_details.get("conflict_detected", False) or (
+            len(conflict_candidates) >= 2
+            and (
+                pairwise_conflict_detected([hit.get("content", "") for hit in conflict_candidates[:4]])
+                or bool(contradiction_flag_hits)
+            )
         )
 
         return {
             "hits": normalized_hits,
             "modules_consulted": list(dict.fromkeys(modules_consulted)),
             "leaf_hit_count": tree_details.get("leaf_hit_count", 0),
+            "leaf_hits": tree_details.get("leaf_hits", []),
             "propagated_hit_count": tree_details.get("propagated_hit_count", 0),
             "gated_hit_count": len(normalized_hits),
             "layer_coverage": layer_coverage,
             "conflict_detected": conflict_detected,
+            "conflict_hits": tree_details.get("conflict_hits", [])[:4],
         }
 
     def evaluate_memory_sufficiency(

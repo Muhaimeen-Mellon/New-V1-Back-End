@@ -79,6 +79,7 @@ class MemoryTreeCore:
         self._updates_available: Optional[bool] = None
         self._typed_columns_available: Optional[bool] = None
         self._embedding_model_name = get_embedding_model_name()
+        self.trait_graph_engine: Optional[Any] = None
 
     def remember(
         self,
@@ -164,6 +165,13 @@ class MemoryTreeCore:
                 user_id,
                 source_kind,
                 salience_score,
+            )
+            self._maybe_process_trait_event(
+                user_id=user_id,
+                source_kind=source_kind,
+                metadata=metadata,
+                created_row=created,
+                node_payload=node_payload,
             )
             return created
         except Exception as exc:
@@ -438,6 +446,7 @@ class MemoryTreeCore:
         input_type: str,
         limit: int = 6,
         retrieval_plan: Optional[QueryRetrievalPlan] = None,
+        exclude_entry_ids: Optional[Sequence[str]] = None,
         return_details: bool = False,
     ) -> Any:
         plan = retrieval_plan or build_query_retrieval_plan(query, input_type=input_type)
@@ -450,6 +459,7 @@ class MemoryTreeCore:
             input_type=input_type,
             retrieval_plan=plan,
             rows=row_lookup,
+            exclude_entry_ids=exclude_entry_ids,
         )[: plan.top_leaf_count]
         propagated_candidates = self._propagate_candidates(
             user_id=user_id,
@@ -697,6 +707,30 @@ class MemoryTreeCore:
             "metadata": metadata,
         }
 
+    def _maybe_process_trait_event(
+        self,
+        *,
+        user_id: str,
+        source_kind: str,
+        metadata: Dict[str, Any],
+        created_row: Dict[str, Any],
+        node_payload: Dict[str, Any],
+    ) -> None:
+        if not self.trait_graph_engine:
+            return
+        if source_kind == "trait_state":
+            return
+        if metadata.get("trait_graph_internal") or metadata.get("trait_state") or metadata.get("review_trace"):
+            return
+        try:
+            self.trait_graph_engine.process_memory_event(
+                user_id=user_id,
+                event_row=created_row,
+                event_node=node_payload,
+            )
+        except Exception as exc:
+            logger.warning("Trait graph processing failed for user '%s': %s", user_id, exc)
+
     def _load_node(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         raw_value = row.get("memory_node")
         if not raw_value:
@@ -894,13 +928,18 @@ class MemoryTreeCore:
         input_type: str,
         retrieval_plan: QueryRetrievalPlan,
         rows: Dict[str, Dict[str, Any]],
+        exclude_entry_ids: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
+        excluded_ids = {str(value) for value in (exclude_entry_ids or []) if value}
         filtered_rows: List[Dict[str, Any]] = []
         filtered_nodes: List[Dict[str, Any]] = []
         filtered_texts: List[str] = []
         embedding_runtime = get_embedding_runtime()
 
         for recency_rank, row in enumerate(rows.values()):
+            row_id = row.get("id")
+            if row_id and str(row_id) in excluded_ids:
+                continue
             node = self._load_node(row)
             if not node:
                 continue
@@ -1556,6 +1595,8 @@ class MemoryTreeCore:
     ) -> bool:
         source_kind = node.get("source_kind", "memory")
         metadata = node.get("metadata") or {}
+        if source_kind == "trait_state":
+            return False
         if metadata.get("review_trace"):
             return False
         if source_kind in {"dream", "simulated_dream", "simulation"} and not retrieval_plan.allow_dream_simulation:
@@ -1593,6 +1634,8 @@ class MemoryTreeCore:
 
     def _determine_logical_layers(self, node: Dict[str, Any]) -> List[str]:
         source_kind = node.get("source_kind", "memory")
+        if source_kind == "trait_state":
+            return []
         metadata = node.get("metadata") or {}
         importance = float(node.get("importance_score", 0.0))
         reinforcement = float(node.get("reinforcement_score", 0.0))

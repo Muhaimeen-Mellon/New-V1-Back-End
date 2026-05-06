@@ -32,6 +32,8 @@ from runtime_config import (
     get_supabase_client,
 )
 from simulation_core import SimulationCore
+from trait_graph_engine import TraitGraphEngine
+from trait_influence_engine import TraitInfluenceEngine
 from tone_core import ToneCore
 
 configure_logging()
@@ -51,6 +53,8 @@ except Exception as exc:  # pragma: no cover - safety fallback
 class MellonRuntime:
     supabase: Any
     memory_tree: MemoryTreeCore
+    trait_graph_engine: TraitGraphEngine
+    trait_influence_engine: TraitInfluenceEngine
     memory_core: MemoryCore
     codex_engine: CodexEngine
     core_router: CoreRouter
@@ -65,6 +69,9 @@ class MellonRuntime:
 def build_runtime() -> MellonRuntime:
     supabase = get_supabase_client()
     memory_tree = MemoryTreeCore(supabase)
+    trait_graph_engine = TraitGraphEngine(memory_tree=memory_tree)
+    trait_influence_engine = TraitInfluenceEngine()
+    memory_tree.trait_graph_engine = trait_graph_engine
     memory_core = MemoryCore(supabase, memory_tree=memory_tree)
     reflection_core = ReflectionCore(supabase, memory_tree=memory_tree)
     codex_engine = CodexEngine(supabase, memory_tree=memory_tree)
@@ -95,6 +102,8 @@ def build_runtime() -> MellonRuntime:
     runtime = MellonRuntime(
         supabase=supabase,
         memory_tree=memory_tree,
+        trait_graph_engine=trait_graph_engine,
+        trait_influence_engine=trait_influence_engine,
         memory_core=memory_core,
         codex_engine=codex_engine,
         core_router=core_router,

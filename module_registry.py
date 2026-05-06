@@ -2,6 +2,8 @@ ACTIVE_RUNTIME_MODULES = {
     "main": "Flask app factory and route wiring.",
     "runtime_config": "Environment loading, logging, and lazy external clients.",
     "memory_tree_core": "Weighted memory scaffold and active-context reinforcement.",
+    "trait_graph_engine": "Phase 1A developmental trait scoring built on retrieved memory evidence.",
+    "trait_influence_engine": "Behavior-expression parameter shaping from stabilized trait state.",
     "core_router": "Memory-first routing and sufficiency decisions for chat.",
     "memory_review_engine": "Compact metacognitive review layer for memory quality inspection.",
     "memory_core": "Persistent memory log access.",

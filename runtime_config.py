@@ -25,6 +25,56 @@ def _as_bool(raw_value: Optional[str], default: bool = False) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _trust_inertia_from_env() -> tuple[float, float, str, bool]:
+    default_old = 0.75
+    default_new = 0.25
+    raw_old = os.getenv("TRUST_INERTIA_OLD_WEIGHT")
+    raw_new = os.getenv("TRUST_INERTIA_NEW_WEIGHT")
+    if raw_old is None and raw_new is None:
+        return default_old, default_new, "default", True
+
+    try:
+        old = float(raw_old) if raw_old is not None else default_old
+        new = float(raw_new) if raw_new is not None else default_new
+    except (TypeError, ValueError):
+        return default_old, default_new, "safe_default_invalid_env", True
+
+    if not (0.0 <= old <= 1.0 and 0.0 <= new <= 1.0):
+        return default_old, default_new, "safe_default_out_of_range_env", True
+
+    total = old + new
+    if total <= 0.0:
+        return default_old, default_new, "safe_default_zero_sum_env", True
+    if abs(total - 1.0) > 1e-6:
+        return old / total, new / total, "env_normalized", True
+    return old, new, "env", True
+
+
+def _preference_inertia_from_env() -> tuple[float, float, str, bool]:
+    default_old = 0.80
+    default_new = 0.20
+    raw_old = os.getenv("PREFERENCE_INERTIA_OLD_WEIGHT")
+    raw_new = os.getenv("PREFERENCE_INERTIA_NEW_WEIGHT")
+    if raw_old is None and raw_new is None:
+        return default_old, default_new, "default", True
+
+    try:
+        old = float(raw_old) if raw_old is not None else default_old
+        new = float(raw_new) if raw_new is not None else default_new
+    except (TypeError, ValueError):
+        return default_old, default_new, "safe_default_invalid_env", True
+
+    if not (0.0 <= old <= 1.0 and 0.0 <= new <= 1.0):
+        return default_old, default_new, "safe_default_out_of_range_env", True
+
+    total = old + new
+    if total <= 0.0:
+        return default_old, default_new, "safe_default_zero_sum_env", True
+    if abs(total - 1.0) > 1e-6:
+        return old / total, new / total, "env_normalized", True
+    return old, new, "env", True
+
+
 def configure_logging(level: Optional[str] = None) -> None:
     root_logger = logging.getLogger()
     target_level = getattr(
@@ -59,6 +109,14 @@ class MellonSettings:
     openrouter_model: str
     openrouter_timeout_seconds: int
     cors_origins: str
+    trust_inertia_old_weight: float
+    trust_inertia_new_weight: float
+    trust_inertia_source: str
+    trust_inertia_validated: bool
+    preference_inertia_old_weight: float
+    preference_inertia_new_weight: float
+    preference_inertia_source: str
+    preference_inertia_validated: bool
 
     @property
     def has_supabase(self) -> bool:
@@ -87,6 +145,9 @@ class MellonSettings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> MellonSettings:
+    trust_inertia_old_weight, trust_inertia_new_weight, trust_inertia_source, trust_inertia_validated = _trust_inertia_from_env()
+    preference_inertia_old_weight, preference_inertia_new_weight, preference_inertia_source, preference_inertia_validated = _preference_inertia_from_env()
+
     local_timeout_raw = os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "45")
     try:
         local_llm_timeout_seconds = int(local_timeout_raw)
@@ -131,6 +192,14 @@ def get_settings() -> MellonSettings:
         openrouter_model=os.getenv("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free"),
         openrouter_timeout_seconds=openrouter_timeout_seconds,
         cors_origins=os.getenv("CORS_ORIGINS", "*"),
+        trust_inertia_old_weight=trust_inertia_old_weight,
+        trust_inertia_new_weight=trust_inertia_new_weight,
+        trust_inertia_source=trust_inertia_source,
+        trust_inertia_validated=trust_inertia_validated,
+        preference_inertia_old_weight=preference_inertia_old_weight,
+        preference_inertia_new_weight=preference_inertia_new_weight,
+        preference_inertia_source=preference_inertia_source,
+        preference_inertia_validated=preference_inertia_validated,
     )
 
 
@@ -313,4 +382,16 @@ def get_runtime_snapshot() -> Dict[str, Any]:
         "model_mode": model_mode,
         "default_model": default_model,
         "debug": settings.debug,
+        "trust_inertia": {
+            "old_weight": settings.trust_inertia_old_weight,
+            "new_weight": settings.trust_inertia_new_weight,
+            "source": settings.trust_inertia_source,
+            "validated": settings.trust_inertia_validated,
+        },
+        "preference_inertia": {
+            "old_weight": settings.preference_inertia_old_weight,
+            "new_weight": settings.preference_inertia_new_weight,
+            "source": settings.preference_inertia_source,
+            "validated": settings.preference_inertia_validated,
+        },
     }
